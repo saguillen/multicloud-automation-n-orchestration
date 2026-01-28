@@ -1,0 +1,141 @@
+name: Build and Deploy Multi-Cloud
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    
+    # ===== AWS ECR =====
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+    
+    - name: Build and push to ECR
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        push: true
+        tags: |
+          ${{ steps.login-ecr.outputs.registry }}/demo-app:${{ env.IMAGE_TAG }}
+          ${{ steps.login-ecr.outputs.registry }}/demo-app:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    # ===== Azure ACR =====
+    - name: Login to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Login to Azure Container Registry
+      run: |
+        az acr login --name ${{ secrets.ACR_NAME }}
+    
+    - name: Build and push to ACR
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        push: true
+        tags: |
+          ${{ secrets.ACR_NAME }}.azurecr.io/demo-app:${{ env.IMAGE_TAG }}
+          ${{ secrets.ACR_NAME }}.azurecr.io/demo-app:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  deploy-aws:
+    name: Deploy to AWS ECS
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    
+    - name: Update ECS service (force new deployment)
+      run: |
+        aws ecs update-service \
+          --cluster demo-cluster-tf \
+          --service demo-service-tf \
+          --force-new-deployment \
+          --region ${{ secrets.AWS_REGION }}
+    
+    - name: Wait for deployment
+      run: |
+        aws ecs wait services-stable \
+          --cluster demo-cluster-tf \
+          --services demo-service-tf \
+          --region ${{ secrets.AWS_REGION }}
+    
+    - name: Deployment successful
+      run: echo "✅ AWS deployment completed!"
+
+  deploy-azure:
+    name: Deploy to Azure Container Apps
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Login to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    
+    - name: Update Container App
+      run: |
+        az containerapp update \
+          --name demo-app-tf \
+          --resource-group demo-rg-tf \
+          --image ${{ secrets.ACR_NAME }}.azurecr.io/demo-app:${{ env.IMAGE_TAG }}
+    
+    - name: Deployment successful
+      run: echo "✅ Azure deployment completed!"
+
+  notify:
+    name: Notify deployment status
+    needs: [deploy-aws, deploy-azure]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Deployment summary
+      run: |
+        echo "🚀 Deployment Summary:"
+        echo "AWS: ${{ needs.deploy-aws.result }}"
+        echo "Azure: ${{ needs.deploy-azure.result }}"
+        echo "Image Tag: ${{ env.IMAGE_TAG }}"
